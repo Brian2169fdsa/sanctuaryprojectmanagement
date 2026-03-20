@@ -654,19 +654,26 @@ document.addEventListener("DOMContentLoaded", async () => {
   }
   try {
     SB = window.supabase.createClient(CONFIG.supabaseUrl, CONFIG.supabaseKey);
-    const {data:{session}, error} = await SB.auth.getSession();
-    if (error) throw error;
-    if (session) { await bootApp(session.user); } else { showView("login"); }
-    SB.auth.onAuthStateChange(async (ev, sess) => {
-      if (ev==="SIGNED_IN"  && sess) await bootApp(sess.user);
-      if (ev==="SIGNED_OUT")         showView("login");
-    });
   } catch(e) {
-    console.error("Boot error:", e);
+    console.error("Failed to create Supabase client:", e);
     showView("login");
     const err = document.getElementById("login-err");
     err.textContent = "Connection error: " + (e.message || "Check Supabase credentials.");
     err.classList.add("show");
+    return;
+  }
+  // Always set up auth listener so sign-in works even if getSession fails
+  SB.auth.onAuthStateChange(async (ev, sess) => {
+    if (ev==="SIGNED_IN"  && sess) await bootApp(sess.user);
+    if (ev==="SIGNED_OUT")         showView("login");
+  });
+  // Try to restore existing session, but don't block login if it fails
+  try {
+    const {data:{session}, error} = await SB.auth.getSession();
+    if (!error && session) { await bootApp(session.user); } else { showView("login"); }
+  } catch(e) {
+    console.error("Session restore failed (non-blocking):", e);
+    showView("login");
   }
 });
 
@@ -711,26 +718,42 @@ async function signIn() {
   const pass  = document.getElementById("l-pass").value;
   const errEl = document.getElementById("login-err");
   errEl.classList.remove("show");
-  const {error} = await SB.auth.signInWithPassword({email, password:pass});
-  if (error) { errEl.textContent = error.message; errEl.classList.add("show"); }
+  if (!email || !pass) { errEl.textContent = "Please enter email and password."; errEl.classList.add("show"); return; }
+  try {
+    const {error} = await SB.auth.signInWithPassword({email, password:pass});
+    if (error) { errEl.textContent = error.message; errEl.classList.add("show"); }
+  } catch(e) {
+    console.error("Sign-in error:", e);
+    errEl.textContent = "Unable to connect. Please try again.";
+    errEl.classList.add("show");
+  }
 }
 async function signOut() { await SB.auth.signOut(); showView("login"); }
 
 // ── DATA ───────────────────────────────
 async function loadAllUsers() {
-  const {data, error} = await SB.from("profiles").select("*").eq("org_id", CONFIG.org);
-  if (error) {
-    console.error("Error loading profiles:", error);
-    allUsers = [];
-  } else {
-    allUsers = data || [];
-  }
   const displayName = currentUser.user_metadata?.full_name || currentUser.email.split("@")[0];
-  const {error: upsertErr} = await SB.from("profiles").upsert({
-    id: currentUser.id, org_id: CONFIG.org,
-    email: currentUser.email, name: displayName, role: currentRole
-  }, {onConflict:"id"});
-  if (upsertErr) console.error("Error upserting profile:", upsertErr);
+  try {
+    const {data, error} = await SB.from("profiles").select("*").eq("org_id", CONFIG.org);
+    if (error) {
+      console.error("Error loading profiles:", error);
+      allUsers = [];
+    } else {
+      allUsers = data || [];
+    }
+  } catch(e) {
+    console.error("Profiles table query failed:", e);
+    allUsers = [];
+  }
+  try {
+    const {error: upsertErr} = await SB.from("profiles").upsert({
+      id: currentUser.id, org_id: CONFIG.org,
+      email: currentUser.email, name: displayName, role: currentRole
+    }, {onConflict:"id"});
+    if (upsertErr) console.error("Error upserting profile:", upsertErr);
+  } catch(e) {
+    console.error("Profile upsert failed:", e);
+  }
   if (!allUsers.find(u=>u.id===currentUser.id)) {
     allUsers.push({id:currentUser.id, email:currentUser.email, name:displayName, role:currentRole});
   }
@@ -766,9 +789,37 @@ async function loadProjects() {
   renderStats();
 }
 
-async function loadUpdates(pid)   { const {data}=await SB.from("updates").select("*").eq("project_id",pid).order("created_at",{ascending:true}); return data||[]; }
-async function loadDocs(pid)      { const {data}=await SB.from("documents").select("*").eq("project_id",pid).order("created_at",{ascending:true}); return data||[]; }
-async function loadAssignees(pid) { const {data}=await SB.from("project_assignments").select("user_id, profiles(name,email)").eq("project_id",pid); return data||[]; }
+async function loadUpdates(pid) {
+  try {
+    const {data, error} = await SB.from("updates").select("*").eq("project_id",pid).order("created_at",{ascending:true});
+    if (error) { console.error("Error loading updates:", error); return []; }
+    return data||[];
+  } catch(e) { console.error("loadUpdates failed:", e); return []; }
+}
+async function loadDocs(pid) {
+  try {
+    const {data, error} = await SB.from("documents").select("*").eq("project_id",pid).order("created_at",{ascending:true});
+    if (error) { console.error("Error loading documents:", error); return []; }
+    return data||[];
+  } catch(e) { console.error("loadDocs failed:", e); return []; }
+}
+async function loadAssignees(pid) {
+  try {
+    let {data, error} = await SB.from("project_assignments").select("user_id, profiles(name,email)").eq("project_id",pid);
+    // Fallback: if nested select fails (missing FK to profiles), try without it
+    if (error) {
+      console.error("Nested assignee select failed, trying simple query:", error);
+      const res = await SB.from("project_assignments").select("user_id").eq("project_id",pid);
+      data = res.data;
+      error = res.error;
+      if (data) {
+        data = data.map(a => ({...a, profiles: allUsers.find(u=>u.id===a.user_id) || {name:"Unknown",email:""}}));
+      }
+    }
+    if (error) { console.error("Error loading assignees:", error); return []; }
+    return data||[];
+  } catch(e) { console.error("loadAssignees failed:", e); return []; }
+}
 
 // ── RENDER GRID ────────────────────────
 function renderGrid() {
@@ -1060,16 +1111,22 @@ async function sendNotify() {
 
 // ── REALTIME ───────────────────────────
 function subscribeRealtime() {
-  SB.channel("src-hub")
-    .on("postgres_changes",{event:"*",schema:"public",table:"projects",filter:`org_id=eq.${CONFIG.org}`},
-      ()=>loadProjects())
-    .on("postgres_changes",{event:"INSERT",schema:"public",table:"updates"},
-      async payload=>{
-        if (detailProjectId && payload.new.project_id===detailProjectId) {
-          renderUpdates(await loadUpdates(detailProjectId));
-        }
-      })
-    .subscribe();
+  try {
+    SB.channel("src-hub")
+      .on("postgres_changes",{event:"*",schema:"public",table:"projects",filter:`org_id=eq.${CONFIG.org}`},
+        ()=>loadProjects())
+      .on("postgres_changes",{event:"INSERT",schema:"public",table:"updates"},
+        async payload=>{
+          if (detailProjectId && payload.new.project_id===detailProjectId) {
+            renderUpdates(await loadUpdates(detailProjectId));
+          }
+        })
+      .subscribe((status, err) => {
+        if (err) console.error("Realtime subscribe error:", err);
+      });
+  } catch(e) {
+    console.error("Realtime setup failed:", e);
+  }
 }
 
 // ── FILTER ─────────────────────────────
