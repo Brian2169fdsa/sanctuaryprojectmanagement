@@ -720,11 +720,26 @@ async function signIn() {
   errEl.classList.remove("show");
   if (!email || !pass) { errEl.textContent = "Please enter email and password."; errEl.classList.add("show"); return; }
   try {
-    const {error} = await SB.auth.signInWithPassword({email, password:pass});
-    if (error) { errEl.textContent = error.message; errEl.classList.add("show"); }
+    const {data, error} = await SB.auth.signInWithPassword({email, password:pass});
+    if (error) {
+      // Detect server-side 500 errors (Supabase down/paused/schema issue)
+      const msg = error.message || "";
+      const status = error.status || error.statusCode || 0;
+      if (status >= 500 || msg.includes("500") || msg.toLowerCase().includes("database error") || msg.toLowerCase().includes("internal server")) {
+        errEl.textContent = "The database server returned an error (500). This usually means the Supabase project is paused or the database is down. Please check your Supabase dashboard and resume the project if needed.";
+      } else {
+        errEl.textContent = msg;
+      }
+      errEl.classList.add("show");
+    }
   } catch(e) {
     console.error("Sign-in error:", e);
-    errEl.textContent = "Unable to connect. Please try again.";
+    const msg = (e && e.message) || "";
+    if (msg.includes("Failed to fetch") || msg.includes("NetworkError") || msg.includes("fetch")) {
+      errEl.textContent = "Network error — cannot reach the server. Check your internet connection or Supabase project status.";
+    } else {
+      errEl.textContent = "Unable to connect: " + (msg || "Unknown error. Please try again.");
+    }
     errEl.classList.add("show");
   }
 }
