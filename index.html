@@ -684,9 +684,24 @@ async function bootApp(user) {
 
   if (currentRole==="admin") document.getElementById("btn-new-wrap").style.display = "flex";
 
-  await loadAllUsers();
-  await loadProjects();
-  subscribeRealtime();
+  // Load data separately from auth — schema/query errors should not block login
+  try {
+    await loadAllUsers();
+  } catch(e) {
+    console.error("Failed to load users:", e);
+    showToast("Failed to load user profiles","err");
+  }
+  try {
+    await loadProjects();
+  } catch(e) {
+    console.error("Failed to load projects:", e);
+    showToast("Failed to load projects","err");
+  }
+  try {
+    subscribeRealtime();
+  } catch(e) {
+    console.error("Realtime subscription failed:", e);
+  }
   showView("app");
 }
 
@@ -703,27 +718,48 @@ async function signOut() { await SB.auth.signOut(); showView("login"); }
 
 // ── DATA ───────────────────────────────
 async function loadAllUsers() {
-  const {data} = await SB.from("profiles").select("*").eq("org_id", CONFIG.org);
-  allUsers = data || [];
+  const {data, error} = await SB.from("profiles").select("*").eq("org_id", CONFIG.org);
+  if (error) {
+    console.error("Error loading profiles:", error);
+    allUsers = [];
+  } else {
+    allUsers = data || [];
+  }
   const displayName = currentUser.user_metadata?.full_name || currentUser.email.split("@")[0];
-  await SB.from("profiles").upsert({
+  const {error: upsertErr} = await SB.from("profiles").upsert({
     id: currentUser.id, org_id: CONFIG.org,
     email: currentUser.email, name: displayName, role: currentRole
   }, {onConflict:"id"});
+  if (upsertErr) console.error("Error upserting profile:", upsertErr);
   if (!allUsers.find(u=>u.id===currentUser.id)) {
     allUsers.push({id:currentUser.id, email:currentUser.email, name:displayName, role:currentRole});
   }
 }
 
 async function loadProjects() {
-  const {data, error} = await SB.from("projects")
+  let {data, error} = await SB.from("projects")
     .select("*, project_assignments(user_id), updates(id), documents(id)")
     .eq("org_id", CONFIG.org)
     .order("created_at",{ascending:false});
-  if (error) { showToast("Failed to load projects","err"); return; }
+
+  // Fallback: if nested select fails (schema/FK error), try simple query
+  if (error) {
+    console.error("Nested select failed, trying simple query:", error);
+    const res = await SB.from("projects")
+      .select("*")
+      .eq("org_id", CONFIG.org)
+      .order("created_at",{ascending:false});
+    data = res.data;
+    error = res.error;
+    if (data) {
+      data = data.map(p => ({...p, project_assignments:[], updates:[], documents:[]}));
+    }
+  }
+
+  if (error) { console.error("Failed to load projects:", error); showToast("Failed to load projects","err"); return; }
   let rows = data || [];
   if (currentRole==="member") {
-    rows = rows.filter(p => p.project_assignments.some(a=>a.user_id===currentUser.id));
+    rows = rows.filter(p => Array.isArray(p.project_assignments) && p.project_assignments.some(a=>a.user_id===currentUser.id));
   }
   allProjects = rows;
   renderGrid();
